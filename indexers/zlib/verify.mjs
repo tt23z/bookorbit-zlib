@@ -689,8 +689,64 @@ console.log('session cache');
   ok('writes nothing back by default', host.saved.length === 0, host.saved.length);
 }
 
-console.log('login redirects');
+console.log('EAPI redirects');
 {
+  // Challenge-style 307 self-redirect with Set-Cookie: replayed, then served.
+  const host = makeHost((url, init) => {
+    if (url.includes('/rpc.php')) return res(LOGIN_OK);
+    if (url.includes('/eapi/book/search')) {
+      if (/clearance=abc123/.test(String(header(init, 'cookie') ?? ''))) return res(SEARCH);
+      return res('', { status: 307, headers: { location: `${PRIMARY}/eapi/book/search`, 'set-cookie': 'clearance=abc123; Path=/' } });
+    }
+    return res('not found', { status: 404 });
+  });
+  const out = await search(host, {}, cfg({ credential: '' }));
+  ok('replays challenge cookies on EAPI redirects', out.length === 3, out.length);
+  ok(
+    're-posts the search after the redirect',
+    host.reqs.filter((r) => r.url.includes('/eapi/book/search')).length === 2,
+    host.calls,
+  );
+}
+{
+  // Cross-host EAPI redirect: refused, foreign host untouched.
+  const host = makeHost((url) => {
+    if (url === `${PRIMARY}/eapi/book/search`) {
+      return res('', { status: 302, headers: { location: 'https://cdn.example.invalid/eapi/book/search' } });
+    }
+    return res('not found', { status: 404 });
+  });
+  const err = await search(host, {}, cfg({ credential: '' })).catch((e) => e);
+  ok(
+    'refuses a cross-host EAPI redirect',
+    err?.code === 'error' && host.calls.every((u) => !u.includes('cdn.example.invalid')),
+    err?.message,
+  );
+}
+{
+  // Self-loop with no new cookie: terminates instead of hitting the host cap.
+  const host = makeHost((url) => {
+    if (url.includes('/eapi/book/search')) return res('', { status: 302, headers: { location: `${PRIMARY}/eapi/book/search` } });
+    return res('not found', { status: 404 });
+  });
+  const err = await search(host, {}, cfg({ credential: '' })).catch((e) => e);
+  ok('reports an EAPI redirect loop as unreachable', err?.code === 'unreachable', err?.message);
+}
+{
+  // Distinct-URL chain past the hop cap: terminates as unreachable.
+  const host = makeHost((url) => {
+    const hop = /\/r(\d+)$/.exec(url)?.[1];
+    if (url.includes('/eapi/book/search') || hop) {
+      const next = hop ? Number(hop) + 1 : 1;
+      return res('', { status: 302, headers: { location: `${PRIMARY}/eapi/r${next}` } });
+    }
+    return res('not found', { status: 404 });
+  });
+  const err = await search(host, {}, cfg({ credential: '' })).catch((e) => e);
+  ok('caps EAPI redirect hops', err?.code === 'unreachable', err?.message);
+}
+
+console.log('login redirects');{
   // A same-host 302 on login is followed with the POST re-issued, then search runs there.
   const host = makeHost((url, init) => {
     if (url === `${PRIMARY}/rpc.php`) return res('', { status: 302, headers: { location: `${PRIMARY}/rpc-alt.php` } });
