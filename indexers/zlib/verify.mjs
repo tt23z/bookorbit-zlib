@@ -48,8 +48,10 @@ const ok = (name, condition, extra) => {
 /** Stub host: fetch is routed by URL with canned Responses, fail captures codes. */
 function makeHost(responder) {
   const reqs = [];
+  const saved = [];
   return {
     reqs,
+    saved,
     get calls() {
       return reqs.map((entry) => entry.url);
     },
@@ -69,7 +71,9 @@ function makeHost(responder) {
     logger: { log: () => {}, warn: () => {} },
     // Stand-in for server search-text semantics: title plus author.
     buildSearchText: (q) => [q.title, q.author].filter(Boolean).join(' '),
-    saveCredential: async () => {},
+    saveCredential: async (value) => {
+      saved.push(String(value));
+    },
     fail: (code, message) => Object.assign(new Error(message), { code }),
   };
 }
@@ -83,8 +87,12 @@ const FALLBACK_B = 'https://z-lib.fm';
 
 const CRED = JSON.stringify({ email: 'reader@example.invalid', password: 'REDACTED-fake-password-0000' });
 
+// Fresh indexer id per config: the plugin caches sessions per base plus id,
+// so unique ids isolate tests from each other. Tests that exercise the cache
+// itself build one config and reuse it.
+let nextCfgId = 7000;
 const cfg = (over = {}) => ({
-  id: 7,
+  id: nextCfgId++,
   name: 'Z-Library',
   priority: 1,
   baseUrl: PRIMARY,
@@ -147,6 +155,19 @@ const header = (init, name) => {
   return key ? h[key] : undefined;
 };
 
+/** Mirror that demands a session: anonymous search is refused, authed serves. */
+const authOnly = (url, init) => {
+  if (url.includes('/rpc.php')) return res(LOGIN_OK);
+  if (url.includes('/eapi/book/search')) return gateSearch(init);
+  if (url.includes('/eapi/user/profile')) return res(PROFILE_OK);
+  if (url.includes('/file')) return res(FILE_LINK);
+  return res('not found', { status: 404 });
+};
+const gateSearch = (init) =>
+  /remix_userid=/.test(String(header(init, 'cookie') ?? ''))
+    ? res(SEARCH)
+    : json({ success: 0, error: 'Please login first; session expired.' });
+
 console.log('declaration');
 ok('targets the contract this build speaks', plugin.apiVersion === 1);
 ok('registers as zlib', plugin.type === 'zlib' && plugin.label === 'Z-Library');
@@ -155,13 +176,16 @@ ok('carries ebooks and audiobooks', JSON.stringify(plugin.mediaKinds) === '["ebo
 ok('supports ISBN search', plugin.supportsIsbnSearch === true);
 ok('joins no swarm and uses no categories', plugin.seedsBack === false && plugin.usesCategories === false);
 ok(
-  'declares exactly the three v1 settings fields',
+  'declares the v1 settings fields plus the session toggle',
   Array.isArray(plugin.settingsFields) &&
-    plugin.settingsFields.length === 3 &&
+    plugin.settingsFields.length === 4 &&
     plugin.settingsFields[0]?.key === 'preferredFormats' &&
     plugin.settingsFields[1]?.key === 'searchOrder' &&
     plugin.settingsFields[2]?.key === 'fallbackMirrors' &&
-    plugin.settingsFields.every((f) => f.type === 'string' && f.format === 'list'),
+    plugin.settingsFields[3]?.key === 'persistSession' &&
+    plugin.settingsFields.slice(0, 3).every((f) => f.type === 'string' && f.format === 'list') &&
+    plugin.settingsFields[3]?.type === 'boolean' &&
+    plugin.settingsFields[3]?.default === false,
   JSON.stringify(plugin.settingsFields?.map((f) => f.key)),
 );
 ok('resolves direct files rather than torrents', typeof plugin.resolveFile === 'function' && plugin.fetchTorrentFile === undefined);
@@ -187,8 +211,17 @@ for (const [name, credential] of [
 
 console.log('search request shape');
 {
+  // The mirror allows anonymous search: no login is spent at all.
   const host = makeHost(happy);
-  await search(host);
+  const out = await search(host);
+  ok('prefers anonymous when the mirror allows it', Array.isArray(out) && out.length === 3, out?.length);
+  ok('spends no login on an anonymous search', !host.calls.some((u) => u.includes('/rpc.php')), host.calls);
+}
+{
+  // The mirror demands a session: anonymous is refused, then login serves.
+  const host = makeHost(authOnly);
+  const out = await search(host);
+  ok('falls back to login on unauthorized', Array.isArray(out) && out.length === 3, out?.length);
   const login = host.reqs.find((r) => r.url.includes('/rpc.php'));
   ok('logs in against rpc.php', login?.url === `${PRIMARY}/rpc.php`, host.calls);
   const body = form(login?.init?.body);
@@ -209,8 +242,8 @@ console.log('search request shape');
   ok('searches with a single POST page', req?.url === `${PRIMARY}/eapi/book/search` && (req?.init?.method ?? 'GET').toUpperCase() === 'POST');
   const sbody = form(req?.init?.body);
   ok('sends page 1 with the requested limit', sbody.get('page') === '1' && sbody.get('limit') === '30', String(req?.init?.body));
-  const cookie = String(header(req?.init, 'cookie') ?? header(login?.init, 'cookie') ?? '');
-  const searchCookie = String(header(req?.init, 'cookie') ?? '');
+  const authed = host.reqs.filter((r) => r.url.includes('/eapi/book/search')).pop();
+  const searchCookie = String(header(authed?.init, 'cookie') ?? '');
   ok('sends the session as a Cookie header on search', searchCookie.includes(SESSION_ID) && searchCookie.includes(SESSION_KEY), searchCookie);
   ok('uses the title text when no ISBN is given', sbody.get('message') === 'Frankenstein Mary Shelley', sbody.get('message'));
 }
@@ -407,9 +440,9 @@ console.log('failures');
   ok('reports an unreachable mirror as unreachable', err?.code === 'unreachable', err?.message);
 }
 {
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url.includes('/rpc.php')) return res(LOGIN_BAD);
-    if (url.includes('/eapi/book/search')) return res(SEARCH);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const err = await search(host).catch((e) => e);
@@ -514,6 +547,7 @@ console.log('test()');
 
 console.log('mirror failover');
 {
+  // Anonymous-first means a dead primary costs one search call, never a login.
   const host = makeHost((url) => {
     if (url.startsWith(PRIMARY)) {
       if (url.includes('/rpc.php')) return res('', { status: 429 });
@@ -525,7 +559,7 @@ console.log('mirror failover');
   });
   const out = await search(host, {}, cfg({ settings: { fallbackMirrors: FALLBACK_A } }));
   ok('serves from the fallback when the primary rate-limits', out.length === 3, out.length);
-  ok('logs in once per mirror tried', host.reqs.filter((r) => r.url.includes('/rpc.php')).length === 2, host.calls);
+  ok('spends no login on the failed primary', !host.reqs.some((r) => r.url.includes('/rpc.php') && r.url.startsWith(PRIMARY)), host.calls);
 }
 {
   const host = makeHost((url) => {
@@ -536,11 +570,14 @@ console.log('mirror failover');
   });
   const out = await search(host, {}, cfg({ settings: { fallbackMirrors: FALLBACK_A } }));
   ok('serves from the fallback when the primary is unreachable', out.length === 3, out.length);
+  ok('spends no login on the unreachable primary', !host.reqs.some((r) => r.url.includes('/rpc.php') && r.url.startsWith(PRIMARY)), host.calls);
 }
 {
-  const host = makeHost((url) => {
+  // Anonymous refused plus bad login: the credential is the problem, so the
+  // fallback is never touched.
+  const host = makeHost((url, init) => {
     if (url.includes('/rpc.php')) return res(LOGIN_BAD);
-    if (url.includes('/eapi/book/search')) return res(SEARCH);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const err = await search(host, {}, cfg({ settings: { fallbackMirrors: FALLBACK_A } })).catch((e) => e);
@@ -559,8 +596,8 @@ console.log('mirror failover');
     return res('not found', { status: 404 });
   });
   const out = await search(host, {}, cfg({ settings: { fallbackMirrors: `${FALLBACK_A}, ${FALLBACK_A}/, gopher://example.invalid/x` } }));
-  const fallbackLogins = host.reqs.filter((r) => r.url.includes('/rpc.php') && r.url.startsWith(FALLBACK_A));
-  ok('dedupes fallback mirrors', fallbackLogins.length === 1, host.calls);
+  const fallbackSearches = host.reqs.filter((r) => r.url.includes('/eapi/book/search') && r.url.startsWith(FALLBACK_A));
+  ok('dedupes fallback mirrors', fallbackSearches.length === 1, host.calls);
   ok('strips trailing slashes', host.calls.every((u) => !u.includes('//eapi')), host.calls);
   ok('never sends the credential to a non-http value', host.calls.every((u) => u.startsWith('http')), host.calls);
   ok('still serves after parsing quirks', out.length === 3);
@@ -582,13 +619,83 @@ console.log('mirror failover');
   ok('touches the primary only when no fallback is configured', new Set(host.origins()).size === 1, host.calls);
 }
 
+console.log('session cache');
+{
+  // One login serves two sequential searches sharing an indexer config.
+  const host = makeHost(authOnly);
+  const config = cfg();
+  const first = await search(host, {}, config);
+  const second = await search(host, {}, config);
+  ok('reuses the cached session across searches', first.length === 3 && second.length === 3, `${first.length}/${second.length}`);
+  ok('logs in once for both searches', host.reqs.filter((r) => r.url.includes('/rpc.php')).length === 1, host.calls);
+}
+{
+  // Concurrent searches share a single login flight.
+  const host = makeHost(authOnly);
+  const config = cfg();
+  const [a, b] = await Promise.all([search(host, {}, config), search(host, {}, config)]);
+  ok('coalesces concurrent logins', a.length === 3 && b.length === 3, `${a.length}/${b.length}`);
+  ok('spends one login for both flights', host.reqs.filter((r) => r.url.includes('/rpc.php')).length === 1, host.calls);
+}
+{
+  // A rejected session heals with exactly one fresh login.
+  let authed = 0;
+  const host = makeHost((url, init) => {
+    if (url.includes('/rpc.php')) return res(LOGIN_OK);
+    if (url.includes('/eapi/book/search')) {
+      if (!/remix_userid=/.test(String(header(init, 'cookie') ?? ''))) return json({ success: 0, error: 'Please login first.' });
+      authed += 1;
+      if (authed === 1) return json({ success: 0, error: 'Session expired, please login again.' });
+      return res(SEARCH);
+    }
+    return res('not found', { status: 404 });
+  });
+  const out = await search(host, {}, cfg());
+  ok('recovers from a stale session', out.length === 3, out.length);
+  // One login to mint the rejected session, one fresh login for the retry.
+  ok('spends one fresh login on recovery', host.reqs.filter((r) => r.url.includes('/rpc.php')).length === 2, host.calls);
+}
+{
+  // A persisted session is trusted on a cold cache with no login at all.
+  const stored = JSON.stringify({ email: 'reader@example.invalid', password: 'x', session: { userId: SESSION_ID, userKey: SESSION_KEY } });
+  const host = makeHost((url, init) => {
+    if (url.includes('/rpc.php')) return res('', { status: 500 });
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
+    return res('not found', { status: 404 });
+  });
+  const out = await search(host, {}, cfg({ credential: stored }));
+  ok('uses a stored session with no login', out.length === 3, out.length);
+  ok('never touches rpc.php on a stored session', !host.calls.some((u) => u.includes('/rpc.php')), host.calls);
+}
+{
+  const host = makeHost(authOnly);
+  const out = await search(host, {}, cfg({ settings: { persistSession: true } }));
+  ok('searches with persistence on', out.length === 3, out.length);
+  ok('writes the session back once', host.saved.length === 1, host.saved.length);
+  const written = JSON.parse(host.saved[0] ?? '{}');
+  ok(
+    'persists the login pair with its session',
+    written.email === 'reader@example.invalid' &&
+      written.password === 'REDACTED-fake-password-0000' &&
+      written.session?.userId === SESSION_ID &&
+      written.session?.userKey === SESSION_KEY,
+    host.saved[0],
+  );
+}
+{
+  const host = makeHost(authOnly);
+  const out = await search(host, {}, cfg());
+  ok('searches with persistence off', out.length === 3, out.length);
+  ok('writes nothing back by default', host.saved.length === 0, host.saved.length);
+}
+
 console.log('login redirects');
 {
   // A same-host 302 on login is followed with the POST re-issued, then search runs there.
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url === `${PRIMARY}/rpc.php`) return res('', { status: 302, headers: { location: `${PRIMARY}/rpc-alt.php` } });
     if (url.includes('/rpc')) return res(LOGIN_OK);
-    if (url.includes('/eapi/book/search')) return res(SEARCH);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const out = await search(host);
@@ -602,10 +709,10 @@ console.log('login redirects');
 }
 {
   // A cross-host 302 on login is refused: the credential must not travel elsewhere.
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url === `${PRIMARY}/rpc.php`) return res('', { status: 302, headers: { location: 'https://login.example.invalid/rpc.php' } });
     if (url.includes('/rpc.php')) return res(LOGIN_OK);
-    if (url.includes('/eapi/book/search')) return res(SEARCH);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const err = await search(host).catch((e) => e);
@@ -617,8 +724,9 @@ console.log('login redirects');
 }
 {
   // Redirect chains terminate instead of looping forever.
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url.includes('/rpc.php')) return res('', { status: 302, headers: { location: '/rpc.php' } });
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const err = await search(host).catch((e) => e);
@@ -627,8 +735,9 @@ console.log('login redirects');
 }
 {
   // A redirect with no destination is a mirror problem, reported plainly.
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url.includes('/rpc.php')) return res('', { status: 302 });
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const err = await search(host).catch((e) => e);
@@ -637,12 +746,12 @@ console.log('login redirects');
 
 {
   // A 302 carrying Set-Cookie is replayed on the retry: the challenge clears.
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url === `${PRIMARY}/rpc.php`) {
       return res('', { status: 302, headers: { location: `${PRIMARY}/rpc-alt.php`, 'set-cookie': 'clearance=abc123; Path=/' } });
     }
     if (url.includes('/rpc')) return res(LOGIN_OK);
-    if (url.includes('/eapi/book/search')) return res(SEARCH);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   const out = await search(host);
@@ -655,13 +764,13 @@ console.log('login redirects');
 }
 {
   // Cookies set by login ride along on the search call.
-  const host = makeHost((url) => {
+  const host = makeHost((url, init) => {
     if (url.includes('/rpc.php')) return res(LOGIN_OK, { headers: { 'set-cookie': 'affinity=s1; Path=/' } });
-    if (url.includes('/eapi/book/search')) return res(SEARCH);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
     return res('not found', { status: 404 });
   });
   await search(host);
-  const call = host.reqs.find((r) => r.url.includes('/eapi/book/search'));
+  const call = host.reqs.filter((r) => r.url.includes('/eapi/book/search')).pop();
   ok(
     'sends harvested cookies alongside the session',
     /affinity=s1/.test(String(header(call?.init, 'cookie') ?? '')) && /remix_userid=/.test(String(header(call?.init, 'cookie') ?? '')),
