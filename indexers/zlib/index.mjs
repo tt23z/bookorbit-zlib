@@ -3,8 +3,10 @@
  *
  * EAPI (JSON) only, no HTML scraping: the HTML path needs a JS proof-of-work the
  * plugin cannot do dependency free, while the EAPI covers login, search and file
- * links. The credential is a JSON login pair, so every operation logs in fresh
- * and keeps the session keys in locals for that call only.
+ * links. The credential is an optional JSON login pair: blank means anonymous
+ * search, while a pair logs in fresh on every authenticated operation and keeps
+ * the session keys in locals for that call only. Grabbing always needs an
+ * account, since the file link is minted against a session.
  *
  * Each grab costs one Z-Library download against a small daily quota, so the
  * picker marks releases freeleech false and quota errors map to throttled.
@@ -109,22 +111,22 @@ const CODE_TO_NAME = {
 
 export default {
   apiVersion: 1,
-  version: '0.1.0',
+  version: '0.2.0',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/tt23z/bookorbit-zlib/main/updates/zlib.json',
     ed25519PublicKey: 'XBRuXnfVuLHqkGogyr5UaLsSlVXRYoplQ4mwXdiHXU0',
   },
   type: 'zlib',
   label: 'Z-Library',
-  requiresCredential: true,
+  requiresCredential: false,
   credentialKind: 'sessionId',
-  /** No comic in v1: cbz rows still surface under ebook. */
+  /** No comic in v1: cbz rows still surface under ebook. Blank credential searches anonymously; grabs need an account. */
   mediaKinds: ['ebook', 'audiobook'],
   supportsIsbnSearch: true,
   usesCategories: false,
   seedsBack: false,
   defaultBaseUrl: 'https://z-library.sk',
-  baseUrlHint: 'Your working Z-Library mirror (e.g. https://z-library.sk). Mirrors change often; update this when searches fail.',
+  baseUrlHint: 'Your working Z-Library mirror (e.g. https://z-library.sk). Mirrors change often; update this when searches fail. Leave the credential blank for anonymous search; grabbing requires an account.',
   settingsFields: [
     {
       key: 'preferredFormats',
@@ -169,7 +171,7 @@ export default {
     return withMirror(config, host, signal, async (base) => {
       if (signal?.aborted) throw fail(host, 'timeout', 'search deadline reached');
       const jar = new Map();
-      const session = await login(base, host, creds, jar);
+      const session = creds ? await login(base, host, creds, jar) : null;
       if (signal?.aborted) return [];
 
       const params = new URLSearchParams();
@@ -183,18 +185,9 @@ export default {
       const response = await authedPost(host, `${base}${SEARCH_PATH}`, session, jar, params.toString());
       const body = await readJson(response, host, 'search');
       if (body?.success !== 1) throw mapEapiFailure(host, body, 'search');
-      const rows = Array.isArray(body.books)
-        ? body.books
-        : Array.isArray(body.data?.books)
-          ? body.data.books
-          : Array.isArray(body.exactMatch?.books)
-            ? body.exactMatch.books
-            : Array.isArray(body.data?.exactMatch?.books)
-              ? body.data.exactMatch.books
-              : [];
 
       const releases = [];
-      for (const row of rows) {
+      for (const row of bookRows(body) ?? []) {
         const release = toRelease(row);
         if (release) releases.push(release);
       }
@@ -202,10 +195,10 @@ export default {
     });
   },
 
-  /** Profile read only: proves the credential without spending quota. Never throws. */
+  /** Account: quota-free profile read. Anonymous: lightweight search probe. Never throws. */
   async test(config, host) {
     try {
-      let creds;
+      let creds = null;
       try {
         creds = parseCredential(config, host);
       } catch (error) {
@@ -219,6 +212,15 @@ export default {
       for (const base of bases) {
         lastBase = base;
         try {
+          if (!creds) {
+            const jar = new Map();
+            const params = new URLSearchParams({ message: 'dickens', page: '1', limit: '1' });
+            const response = await authedPost(host, `${base}${SEARCH_PATH}`, null, jar, params.toString());
+            const body = await readJson(response, host, 'search probe');
+            if (body?.success !== 1) throw mapEapiFailure(host, body, 'search probe');
+            if (!bookRows(body)) throw fail(host, 'error', 'that mirror did not return a Z-Library search response');
+            return { success: true, indexerName: 'Z-Library' };
+          }
           const jar = new Map();
           const session = await login(base, host, creds, jar);
           const response = await authedGet(host, `${base}${PROFILE_PATH}`, session, jar);
@@ -249,6 +251,9 @@ export default {
     const hash = sep === -1 ? '' : guid.slice(sep + 1).trim();
     if (!id || !hash) throw fail(host, 'error', 'unknown release; search again and re-pick it');
     const creds = parseCredential(config, host);
+    if (!creds) {
+      throw fail(host, 'unauthorized', 'grabbing needs a Z-Library account; add the JSON login pair credential and try again');
+    }
 
     return withMirror(config, host, signal, async (base) => {
       if (signal?.aborted) throw fail(host, 'timeout', 'grab deadline reached');
@@ -296,18 +301,20 @@ export default {
   },
 };
 
-/** Login pair from the stored credential; malformed means the operator must re-enter it. */
+/** Optional login pair: blank means anonymous search. Malformed means re-enter it. */
 function parseCredential(config, host) {
+  const raw = String(config?.credential ?? '');
+  if (!raw.trim()) return null;
   let parsed = null;
   try {
-    parsed = JSON.parse(String(config?.credential ?? ''));
+    parsed = JSON.parse(raw);
   } catch {
     parsed = null;
   }
   const email = typeof parsed?.email === 'string' ? parsed.email.trim() : '';
   const password = typeof parsed?.password === 'string' ? parsed.password : '';
   if (!parsed || !email || !password) {
-    throw fail(host, 'unauthorized', 'credential is not a login pair; re-enter it as {"email":...,"password":...}');
+    throw fail(host, 'unauthorized', 'credential is not a login pair; re-enter it as {"email":...,"password":...} or leave it blank for anonymous search');
   }
   return { email, password };
 }
@@ -406,6 +413,15 @@ async function bookDetail(base, host, session, jar, id, hash) {
   const body = await readJson(response, host, 'book detail');
   if (body?.success !== 1) throw mapEapiFailure(host, body, 'book detail');
   return body?.book && typeof body.book === 'object' ? body.book : body;
+}
+
+/** Search rows in any known EAPI shape; null where no shape matches. */
+function bookRows(body) {
+  if (Array.isArray(body?.books)) return body.books;
+  if (Array.isArray(body?.data?.books)) return body.data.books;
+  if (Array.isArray(body?.exactMatch?.books)) return body.exactMatch.books;
+  if (Array.isArray(body?.data?.exactMatch?.books)) return body.data.exactMatch.books;
+  return null;
 }
 
 function toRelease(row) {
@@ -612,14 +628,15 @@ async function authedGet(host, url, session, jar) {
 }
 
 function authHeaders(session, jar) {
+  const cookie = sessionCookie(session, jar);
   return {
     Accept: 'application/json',
     'User-Agent': USER_AGENT,
-    Cookie: sessionCookie(session, jar),
+    ...(cookie ? { Cookie: cookie } : {}),
   };
 }
 
-/** Session keys first, jar affinity/challenge cookies alongside, never logged. */
+/** Session keys first, jar affinity/challenge cookies alongside, never logged. No session means jar only. */
 function sessionCookie(session, jar) {
   const parts = [];
   if (jar) {
@@ -627,7 +644,7 @@ function sessionCookie(session, jar) {
       if (name !== 'remix_userid' && name !== 'remix_userkey') parts.push(`${name}=${value}`);
     }
   }
-  parts.push(`remix_userid=${session.userId}`, `remix_userkey=${session.userKey}`);
+  if (session) parts.push(`remix_userid=${session.userId}`, `remix_userkey=${session.userKey}`);
   return parts.join('; ');
 }
 
