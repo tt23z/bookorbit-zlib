@@ -34,6 +34,7 @@ const MAX_BASES = 3;
 const MAX_EAPI_HOPS = 5;
 
 const LOGIN_PATH = '/rpc.php';
+const EAPI_LOGIN_PATH = '/eapi/user/login';
 const SEARCH_PATH = '/eapi/book/search';
 const PROFILE_PATH = '/eapi/user/profile';
 
@@ -119,7 +120,7 @@ const CODE_TO_NAME = {
 
 export default {
   apiVersion: 1,
-  version: '0.3.1',
+  version: '0.4.0',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/tt23z/bookorbit-zlib/main/updates/zlib.json',
     ed25519PublicKey: 'XBRuXnfVuLHqkGogyr5UaLsSlVXRYoplQ4mwXdiHXU0',
@@ -178,37 +179,24 @@ export default {
   async search(query, config, host, signal) {
     const limit = Number.isFinite(query.limit) ? Math.min(query.limit, MAX_RESULTS) : MAX_RESULTS;
     const creds = parseCredential(config, host);
-    const message = searchMessage(query, host);
     const languageName = languageNameFor(query.language);
     const order = searchOrder(config);
     const extensions = extensionsFor(config, query.mediaKind);
+    // ISBN first for precision; title text as fallback when it draws empty.
+    // Identical messages collapse to one attempt (e.g. a bare-ISBN query).
+    const textMessage = host.buildSearchText(query);
+    const isbnMessage = isbnMessageFor(query);
+    const messages = isbnMessage && isbnMessage !== textMessage.trim()
+      ? [isbnMessage, textMessage]
+      : [textMessage];
 
     return withMirror(config, host, signal, async (base) => {
       if (signal?.aborted) throw fail(host, 'timeout', 'search deadline reached');
       const jar = new Map();
-      const params = new URLSearchParams();
-      params.set('message', message);
-      params.set('page', '1');
-      params.set('limit', String(limit));
-      if (languageName) params.append('languages[0]', languageName);
-      extensions.forEach((ext, i) => params.append(`extensions[${i}]`, ext));
-      params.set('order', order);
-
-      // A session at hand is free, so use it. Otherwise the anonymous attempt
-      // goes first: dead mirrors fail here with no login spent, and a working
-      // mirror answers without one. Login happens only on unauthorized.
-      if (creds && cachedSession(base, config)) {
-        const { value } = await authedOp(base, host, config, creds, jar, (session) => runSearch(host, base, session, jar, params));
-        return value;
-      }
-      try {
-        return await runSearch(host, base, null, jar, params);
-      } catch (error) {
-        if (!creds || failureCode(error) !== 'unauthorized') throw error;
-      }
+      const first = await attemptSearch(host, base, config, creds, jar, messages[0], limit, languageName, order, extensions, signal);
+      if (first.length > 0 || messages.length === 1) return first;
       if (signal?.aborted) return [];
-      const { value } = await authedOp(base, host, config, creds, jar, (session) => runSearch(host, base, session, jar, params));
-      return value;
+      return attemptSearch(host, base, config, creds, jar, messages[1], limit, languageName, order, extensions, signal);
     });
   },
 
@@ -294,8 +282,8 @@ export default {
       const rawLink =
         body?.file?.downloadLink ?? body?.file?.download_link ?? body?.file?.url ?? body?.file?.link ??
         body?.downloadLink ?? body?.url ?? body?.link;
-      const url = absoluteHttpUrl(rawLink, base);
-      if (!url) throw fail(host, 'error', 'download link answered without a usable file URL');
+      const url = absoluteHttpsUrl(rawLink, base);
+      if (!url) throw fail(host, 'error', 'download link answered without a usable HTTPS file URL');
 
       let ext = cleanExt(release?.format);
       let sizeBytes = finiteSize(release?.sizeBytes);
@@ -445,6 +433,32 @@ function persistEnabled(config) {
   return value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
 }
 
+/** One search attempt for a single message: a free session is used when one is
+ * at hand, otherwise the anonymous attempt goes first and login happens only
+ * on unauthorized — so dead mirrors cost one anonymous call, never a login. */
+async function attemptSearch(host, base, config, creds, jar, message, limit, languageName, order, extensions, signal) {
+  const params = new URLSearchParams();
+  params.set('message', message);
+  params.set('page', '1');
+  params.set('limit', String(limit));
+  if (languageName) params.append('languages[0]', languageName);
+  extensions.forEach((ext, i) => params.append(`extensions[${i}]`, ext));
+  params.set('order', order);
+
+  if (creds && cachedSession(base, config)) {
+    const { value } = await authedOp(base, host, config, creds, jar, (session) => runSearch(host, base, session, jar, params));
+    return value;
+  }
+  try {
+    return await runSearch(host, base, null, jar, params);
+  } catch (error) {
+    if (!creds || failureCode(error) !== 'unauthorized') throw error;
+  }
+  if (signal?.aborted) return [];
+  const { value } = await authedOp(base, host, config, creds, jar, (session) => runSearch(host, base, session, jar, params));
+  return value;
+}
+
 /** One search page against either path; null session means anonymous. */
 async function runSearch(host, base, session, jar, params) {
   const response = session
@@ -472,47 +486,36 @@ async function anonPost(host, url, jar, formBody) {
 }
 
 /**
- * One login POST; sessions are cached per base by sessionFor, so this runs
- * once per session lifetime rather than once per operation. rpc.php is the
- * login path that works, not /eapi/user/login, which rejects valid credentials.
- *
- * Same-host redirects are followed (mirrors canonicalize hosts and paths; so do
- * browsers). A cross-host redirect is refused instead of followed: re-posting
- * the credential somewhere the operator never approved is worse than failing.
- *
- * A per-operation cookie jar rides along: mirrors fronted by a challenge layer
- * answer with 302 plus Set-Cookie, and only a client that replays the cookie
- * ever reaches the 200. Without the jar that chain never terminates.
+ * EAPI login first, website-form fallback. The EAPI endpoint sometimes rejects
+ * valid credentials with "Authorization failed" while the website form accepts
+ * them (and vice versa on other mirrors/dates), so an auth- or error-shaped
+ * EAPI refusal falls back to rpc.php and its verdict decides. Mirror-level
+ * problems (throttled/unreachable/timeout) propagate: failover, not fallback,
+ * owns the next mirror.
  */
 async function login(base, host, creds, jar) {
-  return loginAt(`${base}${LOGIN_PATH}`, base, host, creds, jar, 0);
+  try {
+    return await loginEapiAt(`${base}${EAPI_LOGIN_PATH}`, base, host, creds, jar, 0);
+  } catch (error) {
+    const code = failureCode(error);
+    if (code !== 'unauthorized' && code !== 'error') throw error;
+    return loginAt(`${base}${LOGIN_PATH}`, base, host, creds, jar, 0);
+  }
 }
 
-/** One login POST; same-host 30x hops are retried, capped so chains terminate. */
-async function loginAt(url, base, host, creds, jar, hops) {
-  const params = new URLSearchParams({
-    isModal: 'true',
-    email: creds.email,
-    password: creds.password,
-    site_mode: 'books',
-    action: 'login',
-    gg_json_mode: '1',
-    redirectUrl: `${base}/`,
-  });
+/**
+ * One login-form POST with the shared redirect policy: same-host 30x hops are
+ * re-POSTed (capped so chains terminate); cross-host or destination-less
+ * hops refuse without sending the credential elsewhere. Returns the parsed
+ * JSON body.
+ */
+async function postLoginForm(url, base, host, headers, formBody, jar, hops) {
   let response;
   try {
     response = await host.fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        Accept: 'application/json, text/javascript, */*; q=0.01',
-        'X-Requested-With': 'XMLHttpRequest',
-        Origin: base,
-        Referer: `${base}/`,
-        'User-Agent': USER_AGENT,
-        ...cookieHeader(jar),
-      },
-      body: params.toString(),
+      headers: { ...headers, ...cookieHeader(jar) },
+      body: formBody,
       redirect: 'manual',
     });
   } catch (error) {
@@ -534,16 +537,78 @@ async function loginAt(url, base, host, creds, jar, hops) {
       throw fail(host, 'error', 'login redirected to another host; the mirror moved, update the base URL');
     }
     if (hops >= 2) throw fail(host, 'error', `login redirected too many times (last: ${target.pathname}); update the base URL`);
-    return loginAt(target.href, base, host, creds, jar, hops + 1);
+    return postLoginForm(target.href, base, host, headers, formBody, jar, hops + 1);
   }
   checkStatus(response, host);
-  const body = await readJson(response, host, 'login');
+  return readJson(response, host, 'login');
+}
+
+/** EAPI JSON login: plain email plus password, session under user/response. */
+async function loginEapiAt(url, base, host, creds, jar, hops) {
+  const params = new URLSearchParams({ email: creds.email, password: creds.password });
+  const body = await postLoginForm(url, base, host, {
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    Accept: 'application/json',
+    'User-Agent': USER_AGENT,
+  }, params.toString(), jar, hops);
+  const session = sessionFromPayload(body);
+  if (session) return session;
+  throw loginFailure(host, body);
+}
+
+/**
+ * Website-form login (the same POST the site and desktop app send): the extra
+ * fields (action, site_mode, gg_json_mode, isModal, redirectUrl) are what make
+ * it return the session as JSON rather than an HTML redirect, and no CSRF
+ * token or prior cookie is needed.
+ *
+ * Same-host redirects are followed (mirrors canonicalize hosts and paths; so
+ * do browsers). A cross-host redirect is refused instead of followed:
+ * re-posting the credential somewhere the operator never approved is worse
+ * than failing.
+ *
+ * A per-operation cookie jar rides along: mirrors fronted by a challenge
+ * layer answer with 302 plus Set-Cookie, and only a client that replays the
+ * cookie ever reaches the 200. Without the jar that chain never terminates.
+ */
+async function loginAt(url, base, host, creds, jar, hops) {
+  const params = new URLSearchParams({
+    isModal: 'true',
+    email: creds.email,
+    password: creds.password,
+    site_mode: 'books',
+    action: 'login',
+    gg_json_mode: '1',
+    redirectUrl: `${base}/`,
+  });
+  const body = await postLoginForm(url, base, host, {
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    Accept: 'application/json, text/javascript, */*; q=0.01',
+    'X-Requested-With': 'XMLHttpRequest',
+    Origin: base,
+    Referer: `${base}/`,
+    'User-Agent': USER_AGENT,
+  }, params.toString(), jar, hops);
+  const session = sessionFromPayload(body);
+  if (session) return session;
+  throw loginFailure(host, body);
+}
+
+/**
+ * Session keys from either login shape: rpc.php nests them under response,
+ * the EAPI login under user. Null where unusable.
+ */
+function sessionFromPayload(body) {
   const res = body?.response && typeof body.response === 'object' ? body.response : {};
   const user = body?.user && typeof body.user === 'object' ? body.user : {};
   const userId = str(res.user_id ?? res.id ?? user.id ?? user.user_id);
   const userKey = str(res.user_key ?? res.remix_userkey ?? user.remix_userkey ?? user.user_key);
-  if (userId && userKey) return { userId, userKey };
+  return userId && userKey ? { userId, userKey } : null;
+}
 
+/** Server login text to failure code; the EAPI gate wording counts as auth. */
+function loginFailure(host, body) {
+  const res = body?.response && typeof body.response === 'object' ? body.response : {};
   const parts = [];
   if (Array.isArray(body?.errors)) {
     for (const entry of body.errors) parts.push(typeof entry === 'string' ? entry : entry?.message);
@@ -553,7 +618,7 @@ async function loginAt(url, base, host, creds, jar, hops) {
   if (/incorrect email or password|validationerror/i.test(text)) {
     throw fail(host, 'unauthorized', text);
   }
-  if (/please login|not authorized|not logged|session|auth/i.test(text)) {
+  if (/authorization failed|please login|not authorized|not logged|session|auth/i.test(text)) {
     throw fail(host, 'unauthorized', text);
   }
   if (text) throw fail(host, 'error', `login failed: ${text}`);
@@ -657,12 +722,11 @@ function isbnOrNull(value) {
   return ISBN_FIELD_RE.test(cleaned) ? cleaned.toUpperCase() : undefined;
 }
 
-/** ISBN-looking query text goes verbatim; anything else is title plus author text. */
-function searchMessage(query, host) {
+/** ISBN-looking query text, or null when the query carries no ISBN. */
+function isbnMessageFor(query) {
   const raw = query.isbn13 ?? query.isbn13s?.[0] ?? null;
   const cleaned = String(raw ?? '').replace(/[- ]/g, '').trim();
-  if (cleaned && ISBN_LIKE_RE.test(cleaned)) return cleaned.toUpperCase();
-  return host.buildSearchText(query);
+  return cleaned && ISBN_LIKE_RE.test(cleaned) ? cleaned.toUpperCase() : null;
 }
 
 /** Unmapped request languages omit the param and let the server-side filter decide. */
@@ -1009,12 +1073,16 @@ function urlExt(url) {
   return match ? match[1].toLowerCase() : '';
 }
 
-function absoluteHttpUrl(raw, base) {
+/** Absolute HTTPS file URL, or null. Plain HTTP and credentialed URLs refuse:
+ * book bytes must travel encrypted, and a userinfo URL is never legitimate
+ * here — the download service sends no cookies, so auth rides the link. */
+function absoluteHttpsUrl(raw, base) {
   const trimmed = String(raw ?? '').trim();
   if (!trimmed) return null;
   try {
     const url = new URL(trimmed, base);
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+    if (url.protocol !== 'https:' || url.username || url.password) return null;
+    return url.href;
   } catch {
     return null;
   }
