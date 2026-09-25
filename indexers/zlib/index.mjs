@@ -8,6 +8,12 @@
  * the session keys in locals for that call only. Grabbing always needs an
  * account, since the file link is minted against a session.
  *
+ * Authenticated searches prefer anonymous first and log in only when the mirror
+ * answers unauthorized, so dead mirrors cost one anonymous call and never a
+ * login. Sessions live in a per-base in-memory cache (single-flight logins,
+ * one retry on a rejected session), and only when the persistSession setting
+ * is on are they written back via host.saveCredential for the next restart.
+ *
  * Each grab costs one Z-Library download against a small daily quota, so the
  * picker marks releases freeleech false and quota errors map to throttled.
  * Mirrors churn under enforcement pressure; the operator owns baseUrl plus the
@@ -111,7 +117,7 @@ const CODE_TO_NAME = {
 
 export default {
   apiVersion: 1,
-  version: '0.2.0',
+  version: '0.3.0',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/tt23z/bookorbit-zlib/main/updates/zlib.json',
     ed25519PublicKey: 'XBRuXnfVuLHqkGogyr5UaLsSlVXRYoplQ4mwXdiHXU0',
@@ -158,6 +164,13 @@ export default {
       options: ['https://z-library.sk', 'https://z-lib.gd', 'https://z-lib.sk', 'https://z-lib.fm', 'https://1lib.sk'],
       minItems: 0,
     },
+    {
+      key: 'persistSession',
+      type: 'boolean',
+      label: 'Persist session',
+      hint: 'Write the login session back to the credential store after logging in, so a restart reuses it instead of logging in again. Off means sessions live only in memory.',
+      default: false,
+    },
   ],
 
   async search(query, config, host, signal) {
@@ -171,9 +184,6 @@ export default {
     return withMirror(config, host, signal, async (base) => {
       if (signal?.aborted) throw fail(host, 'timeout', 'search deadline reached');
       const jar = new Map();
-      const session = creds ? await login(base, host, creds, jar) : null;
-      if (signal?.aborted) return [];
-
       const params = new URLSearchParams();
       params.set('message', message);
       params.set('page', '1');
@@ -182,16 +192,21 @@ export default {
       extensions.forEach((ext, i) => params.append(`extensions[${i}]`, ext));
       params.set('order', order);
 
-      const response = await authedPost(host, `${base}${SEARCH_PATH}`, session, jar, params.toString());
-      const body = await readJson(response, host, 'search');
-      if (body?.success !== 1) throw mapEapiFailure(host, body, 'search');
-
-      const releases = [];
-      for (const row of bookRows(body) ?? []) {
-        const release = toRelease(row);
-        if (release) releases.push(release);
+      // A session at hand is free, so use it. Otherwise the anonymous attempt
+      // goes first: dead mirrors fail here with no login spent, and a working
+      // mirror answers without one. Login happens only on unauthorized.
+      if (creds && cachedSession(base, config)) {
+        const { value } = await authedOp(base, host, config, creds, jar, (session) => runSearch(host, base, session, jar, params));
+        return value;
       }
-      return releases;
+      try {
+        return await runSearch(host, base, null, jar, params);
+      } catch (error) {
+        if (!creds || failureCode(error) !== 'unauthorized') throw error;
+      }
+      if (signal?.aborted) return [];
+      const { value } = await authedOp(base, host, config, creds, jar, (session) => runSearch(host, base, session, jar, params));
+      return value;
     });
   },
 
@@ -222,12 +237,13 @@ export default {
             return { success: true, indexerName: 'Z-Library' };
           }
           const jar = new Map();
-          const session = await login(base, host, creds, jar);
-          const response = await authedGet(host, `${base}${PROFILE_PATH}`, session, jar);
-          const body = await readJson(response, host, 'profile check');
-          if (body?.success !== 1) throw mapEapiFailure(host, body, 'profile check');
-          const user = body.user ?? body.profile ?? (body.response && typeof body.response === 'object' ? body.response : null);
-          if (!user) return { success: false, error: 'that mirror answered without a user profile' };
+          await authedOp(base, host, config, creds, jar, async (session) => {
+            const response = await authedGet(host, `${base}${PROFILE_PATH}`, session, jar);
+            const body = await readJson(response, host, 'profile check');
+            if (body?.success !== 1) throw mapEapiFailure(host, body, 'profile check');
+            const user = body.user ?? body.profile ?? (body.response && typeof body.response === 'object' ? body.response : null);
+            if (!user) throw fail(host, 'error', 'that mirror answered without a user profile');
+          });
           return { success: true, indexerName: 'Z-Library' };
         } catch (error) {
           if (failureCode(error) === 'unauthorized') return { success: false, error: messageOf(error) };
@@ -258,20 +274,20 @@ export default {
     return withMirror(config, host, signal, async (base) => {
       if (signal?.aborted) throw fail(host, 'timeout', 'grab deadline reached');
       const jar = new Map();
-      const session = await login(base, host, creds, jar);
-      if (signal?.aborted) throw fail(host, 'timeout', 'grab deadline reached');
-
-      const response = await authedGet(
-        host,
-        `${base}/eapi/book/${encodeURIComponent(id)}/${encodeURIComponent(hash)}/file`,
-        session,
-        jar,
-      );
-      const body = await readJson(response, host, 'download link');
-      if (body?.success !== 1) throw mapEapiFailure(host, body, 'download link');
-      if (body?.allowDownload === false || body?.file?.allowDownload === false) {
-        throw fail(host, 'throttled', 'download link: daily download limit is spent; try again tomorrow');
-      }
+      const { value: body } = await authedOp(base, host, config, creds, jar, async (session) => {
+        const response = await authedGet(
+          host,
+          `${base}/eapi/book/${encodeURIComponent(id)}/${encodeURIComponent(hash)}/file`,
+          session,
+          jar,
+        );
+        const parsed = await readJson(response, host, 'download link');
+        if (parsed?.success !== 1) throw mapEapiFailure(host, parsed, 'download link');
+        if (parsed?.allowDownload === false || parsed?.file?.allowDownload === false) {
+          throw fail(host, 'throttled', 'download link: daily download limit is spent; try again tomorrow');
+        }
+        return parsed;
+      });
 
       const rawLink =
         body?.file?.downloadLink ?? body?.file?.download_link ?? body?.file?.url ?? body?.file?.link ??
@@ -283,7 +299,8 @@ export default {
       let sizeBytes = finiteSize(release?.sizeBytes);
       if (!ext || sizeBytes === null) {
         if (signal?.aborted) throw fail(host, 'timeout', 'grab deadline reached');
-        const detail = await bookDetail(base, host, session, jar, id, hash).catch(() => null);
+        const session = cachedSession(base, config);
+        const detail = session ? await bookDetail(base, host, session, jar, id, hash).catch(() => null) : null;
         if (detail) {
           if (!ext) ext = cleanExt(detail.extension) || urlExt(url);
           if (sizeBytes === null) sizeBytes = parseSize(detail.filesizeString, detail.filesize);
@@ -316,11 +333,155 @@ function parseCredential(config, host) {
   if (!parsed || !email || !password) {
     throw fail(host, 'unauthorized', 'credential is not a login pair; re-enter it as {"email":...,"password":...} or leave it blank for anonymous search');
   }
-  return { email, password };
+  return { email, password, storedSession: validSession(parsed?.session) };
+}
+
+/** A persisted session from the credential store; null where unusable. */
+function validSession(value) {
+  if (!value || typeof value !== 'object') return null;
+  const userId = str(value.userId ?? value.id ?? value.user_id).trim();
+  const userKey = str(value.userKey ?? value.key ?? value.remix_userkey ?? value.user_key).trim();
+  return userId && userKey ? { userId, userKey } : null;
 }
 
 /**
- * Fresh session per operation; nothing is cached across calls. rpc.php is the
+ * Per-base session cache. Keys include the indexer id so two indexers sharing
+ * a mirror never share a session, and every entry remembers the credential it
+ * was minted with so a changed credential never reuses a stale session.
+ * Secrets live here for the life of the process; nothing is written to disk
+ * unless the persistSession setting opts into saveCredential write-back.
+ */
+const sessions = new Map();
+const pendingLogins = new Map();
+
+function sessionKey(base, config) {
+  return `${String(base ?? '').toLowerCase()}\n${config?.id ?? ''}`;
+}
+
+/** A free session or null; never logs in. */
+function cachedSession(base, config) {
+  const entry = sessions.get(sessionKey(base, config));
+  const rawCred = String(config?.credential ?? '');
+  return entry && entry.credential === rawCred && entry.session ? entry.session : null;
+}
+
+function dropSession(base, config) {
+  sessions.delete(sessionKey(base, config));
+}
+
+/**
+ * The one way authenticated calls get a session: memory cache first, then a
+ * persisted session carried in the credential, then a single-flight login so
+ * concurrent operations share one POST. Challenge cookies from a shared login
+ * merge into the caller's jar afterwards.
+ */
+async function sessionFor(base, host, config, creds, jar) {
+  const key = sessionKey(base, config);
+  const rawCred = String(config?.credential ?? '');
+  const hit = sessions.get(key);
+  if (hit && hit.credential === rawCred && hit.session) return hit.session;
+  if ((!hit || hit.credential !== rawCred) && creds?.storedSession) {
+    sessions.set(key, { credential: rawCred, session: creds.storedSession });
+    return creds.storedSession;
+  }
+  let pending = pendingLogins.get(key);
+  if (!pending || pending.credential !== rawCred) {
+    const entry = { credential: rawCred, jar: new Map(), promise: null };
+    entry.promise = (async () => {
+      const session = await login(base, host, creds, entry.jar);
+      sessions.set(key, { credential: rawCred, session });
+      await maybePersistSession(host, config, creds, session);
+      return session;
+    })();
+    pendingLogins.set(key, entry);
+    pending = entry;
+  }
+  try {
+    return await pending.promise;
+  } finally {
+    if (pendingLogins.get(key) === pending) pendingLogins.delete(key);
+    for (const [name, value] of pending.jar) {
+      if (!jar.has(name)) jar.set(name, value);
+    }
+  }
+}
+
+/**
+ * Runs an authenticated operation with one self-heal: a rejected session is
+ * dropped and the operation retried once on a fresh login (the password is at
+ * hand, so invalidation recovers instead of failing). A second rejection
+ * means the credential itself is bad and propagates.
+ */
+async function authedOp(base, host, config, creds, jar, op) {
+  const first = await sessionFor(base, host, config, creds, jar);
+  try {
+    return { session: first, value: await op(first) };
+  } catch (error) {
+    if (failureCode(error) !== 'unauthorized') throw error;
+    dropSession(base, config);
+    const fresh = await sessionFor(base, host, config, creds, jar);
+    return { session: fresh, value: await op(fresh) };
+  }
+}
+
+/** Best-effort write-back; the memory cache holds the session regardless. */
+async function maybePersistSession(host, config, creds, session) {
+  if (!persistEnabled(config) || typeof host.saveCredential !== 'function') return;
+  try {
+    await host.saveCredential(JSON.stringify({
+      email: creds.email,
+      password: creds.password,
+      session: { userId: session.userId, userKey: session.userKey },
+    }));
+  } catch {
+    // The store write is optional; the failure is not worth the operation.
+  }
+}
+
+function persistEnabled(config) {
+  const value = config?.settings?.persistSession;
+  return value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
+}
+
+/** One search page against either path; null session means anonymous. */
+async function runSearch(host, base, session, jar, params) {
+  const response = session
+    ? await authedPost(host, `${base}${SEARCH_PATH}`, session, jar, params.toString())
+    : await anonPost(host, `${base}${SEARCH_PATH}`, jar, params.toString());
+  const body = await readJson(response, host, 'search');
+  if (body?.success !== 1) throw mapEapiFailure(host, body, 'search');
+  const releases = [];
+  for (const row of bookRows(body) ?? []) {
+    const release = toRelease(row);
+    if (release) releases.push(release);
+  }
+  return releases;
+}
+
+async function anonPost(host, url, jar, formBody) {
+  let response;
+  try {
+    response = await host.fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        ...cookieHeader(jar),
+      },
+      body: formBody,
+    });
+  } catch (error) {
+    throw mapFetchThrow(host, error);
+  }
+  harvestCookies(response, jar);
+  checkStatus(response, host);
+  return response;
+}
+
+/**
+ * One login POST; sessions are cached per base by sessionFor, so this runs
+ * once per session lifetime rather than once per operation. rpc.php is the
  * login path that works, not /eapi/user/login, which rejects valid credentials.
  *
  * Same-host redirects are followed (mirrors canonicalize hosts and paths; so do
