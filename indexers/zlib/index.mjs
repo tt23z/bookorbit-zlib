@@ -30,6 +30,8 @@ const USER_AGENT = 'BookOrbit';
 /** One EAPI page per search; login plus one call fits the per-indexer deadline. */
 const MAX_RESULTS = 30;
 const MAX_BASES = 3;
+/** Challenge layers bounce EAPI calls through same-origin redirects; follow a few, then call the mirror dead. */
+const MAX_EAPI_HOPS = 5;
 
 const LOGIN_PATH = '/rpc.php';
 const SEARCH_PATH = '/eapi/book/search';
@@ -117,7 +119,7 @@ const CODE_TO_NAME = {
 
 export default {
   apiVersion: 1,
-  version: '0.3.0',
+  version: '0.3.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/tt23z/bookorbit-zlib/main/updates/zlib.json',
     ed25519PublicKey: 'XBRuXnfVuLHqkGogyr5UaLsSlVXRYoplQ4mwXdiHXU0',
@@ -459,22 +461,12 @@ async function runSearch(host, base, session, jar, params) {
 }
 
 async function anonPost(host, url, jar, formBody) {
-  let response;
-  try {
-    response = await host.fetch(url, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': USER_AGENT,
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        ...cookieHeader(jar),
-      },
-      body: formBody,
-    });
-  } catch (error) {
-    throw mapFetchThrow(host, error);
-  }
-  harvestCookies(response, jar);
+  const response = await fetchEapi(
+    host,
+    url,
+    { method: 'POST', headers: baseHeaders(true), body: formBody, session: null },
+    jar,
+  );
   checkStatus(response, host);
   return response;
 }
@@ -758,43 +750,85 @@ async function withMirror(config, host, signal, op) {
 }
 
 async function authedPost(host, url, session, jar, formBody) {
-  let response;
-  try {
-    response = await host.fetch(url, {
-      method: 'POST',
-      headers: {
-        ...authHeaders(session, jar),
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      },
-      body: formBody,
-    });
-  } catch (error) {
-    throw mapFetchThrow(host, error);
-  }
-  harvestCookies(response, jar);
+  const response = await fetchEapi(
+    host,
+    url,
+    { method: 'POST', headers: baseHeaders(true), body: formBody, session },
+    jar,
+  );
   checkStatus(response, host);
   return response;
 }
 
 async function authedGet(host, url, session, jar) {
-  let response;
-  try {
-    response = await host.fetch(url, { headers: authHeaders(session, jar) });
-  } catch (error) {
-    throw mapFetchThrow(host, error);
-  }
-  harvestCookies(response, jar);
+  const response = await fetchEapi(host, url, { headers: baseHeaders(), session }, jar);
   checkStatus(response, host);
   return response;
 }
 
-function authHeaders(session, jar) {
-  const cookie = sessionCookie(session, jar);
+/**
+ * Same-origin redirects with cookie replay, for every EAPI call. Mirrors front
+ * the API with a challenge layer that 307s to the same path plus Set-Cookie
+ * and only serves a client that replays it; the host's auto-follow never
+ * learns cookies, so it loops into the hop cap instead. Method and body are
+ * preserved across hops (the EAPI needs its POST back); cross-origin hops are
+ * refused so a session never travels somewhere unapproved.
+ */
+async function fetchEapi(host, url, { method = 'GET', headers = {}, body, session = null }, jar) {
+  const baseHeaders = { ...headers };
+  let current = url;
+  let currentMethod = method;
+  let currentBody = body;
+  const seen = new Set();
+  for (let hop = 0; hop <= MAX_EAPI_HOPS; hop += 1) {
+    let response;
+    try {
+      response = await host.fetch(current, {
+        method: currentMethod,
+        headers: { ...baseHeaders, ...sessionCookieHeader(session, jar) },
+        ...(currentBody === undefined ? {} : { body: currentBody }),
+        redirect: 'manual',
+      });
+    } catch (error) {
+      throw mapFetchThrow(host, error);
+    }
+    harvestCookies(response, jar);
+    if (!isRedirect(response.status)) return response;
+    const target = redirectTarget(response, current);
+    if (response.body) {
+      try {
+        await response.body.cancel();
+      } catch {
+        // The body is abandoned either way; the retry is what matters.
+      }
+    }
+    if (!target) throw fail(host, 'error', 'EAPI request redirected without a destination; try another mirror');
+    if (target.origin !== new URL(current).origin) {
+      throw fail(host, 'error', 'EAPI request redirected to another host; update the base URL');
+    }
+    if (seen.has(target.href)) {
+      throw fail(host, 'unreachable', 'EAPI request entered a redirect loop; try another mirror');
+    }
+    if (hop === MAX_EAPI_HOPS) {
+      throw fail(host, 'unreachable', 'EAPI request redirected too many times; try another mirror');
+    }
+    seen.add(target.href);
+    current = target.href;
+  }
+  throw fail(host, 'unreachable', 'EAPI request redirected too many times; try another mirror');
+}
+
+function baseHeaders(form = false) {
   return {
     Accept: 'application/json',
     'User-Agent': USER_AGENT,
-    ...(cookie ? { Cookie: cookie } : {}),
+    ...(form ? { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } : {}),
   };
+}
+
+function sessionCookieHeader(session, jar) {
+  const cookie = sessionCookie(session, jar);
+  return cookie ? { Cookie: cookie } : {};
 }
 
 /** Session keys first, jar affinity/challenge cookies alongside, never logged. No session means jar only. */
