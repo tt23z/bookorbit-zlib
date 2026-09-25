@@ -24,6 +24,8 @@ const FILE_LINK = fixture('file-link.json');
 const FILE_QUOTA = fixture('file-quota.json');
 const LOGIN_OK = fixture('login-ok.json');
 const LOGIN_BAD = fixture('login-bad.json');
+const LOGIN_EAPI_OK = fixture('login-eapi-ok.json');
+const LOGIN_EAPI_GATED = fixture('login-eapi-gated.json');
 const PROFILE_OK = fixture('profile-ok.json');
 
 const LOGIN_OK_BODY = JSON.parse(LOGIN_OK);
@@ -254,6 +256,33 @@ console.log('search request shape');
   ok('prefers the isbn13 over title text', form(req?.init?.body).get('message') === '9780141182636', String(req?.init?.body));
 }
 {
+  const host = makeHost((url, init) => {
+    if (url.includes('/eapi/book/search')) {
+      return form(init?.body).get('message') === '9780141182636' ? res(SEARCH_EMPTY) : res(SEARCH);
+    }
+    return res('not found', { status: 404 });
+  });
+  const out = await search(host, { isbn13: '978-0-14-118263-6' }, cfg({ credential: '' }));
+  ok('falls back to title text when the ISBN draws empty', out.length === 3, out?.length);
+  const messages = host.reqs
+    .filter((r) => r.url.includes('/eapi/book/search'))
+    .map((r) => form(r.init?.body).get('message'));
+  ok(
+    'tries the ISBN before the text',
+    JSON.stringify(messages) === JSON.stringify(['9780141182636', 'Frankenstein Mary Shelley']),
+    messages.join(' | '),
+  );
+}
+{
+  const host = makeHost(happy);
+  const out = await search(host, { isbn13: '978-0-14-118263-6' }, cfg({ credential: '' }));
+  ok(
+    'an ISBN hit costs no second search',
+    out.length === 3 && host.reqs.filter((r) => r.url.includes('/eapi/book/search')).length === 1,
+    out?.length,
+  );
+}
+{
   const host = makeHost(happy);
   await search(host, { limit: 100 });
   const req = host.reqs.find((r) => r.url.includes('/eapi/book/search'));
@@ -264,6 +293,81 @@ console.log('search request shape');
   await search(host, { limit: 5 });
   const req = host.reqs.find((r) => r.url.includes('/eapi/book/search'));
   ok('asks for no more than the request wanted', form(req?.init?.body).get('limit') === '5', String(req?.init?.body));
+}
+
+console.log('eapi login first, rpc.php fallback');
+{
+  // The EAPI login answers: rpc.php is never touched, session comes from user.*.
+  const host = makeHost((url, init) => {
+    if (url.includes('/eapi/user/login')) return res(LOGIN_EAPI_OK);
+    if (url.includes('/rpc.php')) return res(LOGIN_OK);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
+    return res('not found', { status: 404 });
+  });
+  const out = await search(host);
+  ok('logs in through the EAPI endpoint first', out.length === 3, out?.length);
+  ok('never touches rpc.php when EAPI login answers', !host.calls.some((u) => u.includes('/rpc.php')), host.calls);
+  const loginCall = host.reqs.find((r) => r.url.includes('/eapi/user/login'));
+  const loginBody = form(loginCall?.init?.body);
+  ok(
+    'sends a plain email plus password body',
+    loginBody.get('email') === 'reader@example.invalid' &&
+      loginBody.get('password') === 'REDACTED-fake-password-0000' &&
+      loginBody.get('action') === null,
+    String(loginCall?.init?.body),
+  );
+  const authed = host.reqs.filter((r) => r.url.includes('/eapi/book/search')).pop();
+  const cookie = String(header(authed?.init, 'cookie') ?? '');
+  ok('searches with the EAPI session', cookie.includes('424242') && cookie.includes('REDACTED-FAKE-EAPI-KEY-0000'), cookie);
+}
+{
+  // The EAPI gates a valid password ("Authorization failed"): the website
+  // form decides instead.
+  const host = makeHost((url, init) => {
+    if (url.includes('/eapi/user/login')) return res(LOGIN_EAPI_GATED);
+    if (url.includes('/rpc.php')) return res(LOGIN_OK);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
+    return res('not found', { status: 404 });
+  });
+  const out = await search(host);
+  ok('falls back to rpc.php when EAPI login gates the password', out.length === 3, out?.length);
+  ok(
+    'tries the EAPI endpoint before the website form',
+    host.calls.findIndex((u) => u.includes('/eapi/user/login')) !== -1 &&
+      host.calls.findIndex((u) => u.includes('/eapi/user/login')) < host.calls.findIndex((u) => u.includes('/rpc.php')),
+    host.calls,
+  );
+}
+{
+  // Both doors shut: unauthorized, carrying the form's verdict.
+  const host = makeHost((url, init) => {
+    if (url.includes('/eapi/user/login')) return res(LOGIN_EAPI_GATED);
+    if (url.includes('/rpc.php')) return res(LOGIN_BAD);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
+    return res('not found', { status: 404 });
+  });
+  const err = await search(host).catch((e) => e);
+  ok(
+    'reports unauthorized when both logins refuse',
+    err?.code === 'unauthorized' && /incorrect email or password/i.test(err?.message ?? ''),
+    err?.message,
+  );
+}
+{
+  // A throttled EAPI login is a mirror problem, not a credential one: no
+  // fallback login is burned, failover owns the next mirror.
+  const host = makeHost((url, init) => {
+    if (url.includes('/eapi/user/login')) return res('', { status: 429 });
+    if (url.includes('/rpc.php')) return res(LOGIN_OK);
+    if (url.includes('/eapi/book/search')) return gateSearch(init);
+    return res('not found', { status: 404 });
+  });
+  const err = await search(host).catch((e) => e);
+  ok(
+    'a throttled EAPI login never falls back to the form',
+    err?.code === 'throttled' && !host.calls.some((u) => u.includes('/rpc.php')),
+    err?.message,
+  );
 }
 
 console.log('mapping');
@@ -498,6 +602,21 @@ for (const [name, payload] of [
     .resolveFile({ ...release, format: undefined }, cfg(), pdfHost, AbortSignal.timeout(5000))
     .catch((e) => e);
   ok('falls back to the link extension when the release states none', file?.format === 'pdf' && file?.fileName.endsWith('.pdf'), `${file?.fileName}/${file?.format}`);
+}
+for (const [name, link] of [
+  ['plain HTTP', 'http://cdn-plain.example.invalid/dl/x/Book.epub'],
+  ['credentialed', 'https://user:pass@cdn-fallback.example.invalid/dl/x/Book.epub'],
+]) {
+  const host = makeHost(happy);
+  const [release] = await search(host);
+  const linkHost = makeHost((url) => {
+    if (url.includes('/rpc.php')) return res(LOGIN_OK);
+    if (url.includes('/eapi/user/login')) return res(LOGIN_EAPI_OK);
+    if (url.includes('/file')) return json({ success: 1, file: { downloadLink: link, allowDownload: true, extension: 'epub' } });
+    return res('not found', { status: 404 });
+  });
+  const err = await plugin.resolveFile(release, cfg(), linkHost, AbortSignal.timeout(5000)).catch((e) => e);
+  ok(`refuses a ${name} download link`, err?.code === 'error' && /https/i.test(err?.message ?? ''), err?.message);
 }
 {
   const host = makeHost(happy);
