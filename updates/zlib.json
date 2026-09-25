@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "type": "zlib",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "sourceUrl": "https://raw.githubusercontent.com/tt23z/bookorbit-zlib/main/indexers/zlib/index.mjs",
-  "sha256": "cd3c377cfc8f0e7aa43b7c36f2ff639330ef4a0ffee484d4375bac33e65393d0",
-  "signature": "BKVKvOgQWbvs+Ob+g0nGQKiih12neYl9W3gaeZPQBdf5Vn62XoH+/B9P8IthxWfx7tC7KEBPvDkAb4lyaMP2CQ=="
+  "sha256": "55205dbb263b5ce4509245e8350d2dd54eff49ca711c329baebad5b9fa3158f1",
+  "signature": "LjeLlwLVAx9nk1qRLay26ExsHl5DVdfSvnHwJPMtHx2rNzDufZx9+bL1FKSeKv4HQ08wGCZ1wToT46shY4nwBg=="
 }
