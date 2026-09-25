@@ -150,7 +150,7 @@ const header = (init, name) => {
 console.log('declaration');
 ok('targets the contract this build speaks', plugin.apiVersion === 1);
 ok('registers as zlib', plugin.type === 'zlib' && plugin.label === 'Z-Library');
-ok('requires a session credential', plugin.requiresCredential === true && plugin.credentialKind === 'sessionId');
+ok('leaves the credential optional for anonymous search', plugin.requiresCredential === false && plugin.credentialKind === 'sessionId');
 ok('carries ebooks and audiobooks', JSON.stringify(plugin.mediaKinds) === '["ebook","audiobook"]');
 ok('supports ISBN search', plugin.supportsIsbnSearch === true);
 ok('joins no swarm and uses no categories', plugin.seedsBack === false && plugin.usesCategories === false);
@@ -174,7 +174,6 @@ for (const [name, credential] of [
   ['colon pair instead of JSON', 'reader@example.invalid:secret'],
   ['missing password', JSON.stringify({ email: 'reader@example.invalid' })],
   ['missing email', JSON.stringify({ password: 'x' })],
-  ['empty credential', ''],
 ]) {
   const host = makeHost(happy);
   const err = await search(host, {}, cfg({ credential })).catch((e) => e);
@@ -277,6 +276,55 @@ for (const [name, patch, expected] of [
   const host = makeHost(searchWithBooks([sizedBook({ identifier: '978-0-14-118263-6' })]));
   const [one] = await search(host);
   ok('strips ISBN separators before passing through', one?.isbn === '9780141182636', one?.isbn);
+}
+
+console.log('anonymous search');
+{
+  const host = makeHost(happy);
+  const out = await search(host, {}, cfg({ credential: '   ' }));
+  ok('treats a whitespace-only credential as anonymous', Array.isArray(out) && out.length === 3, out?.length);
+  ok('skips login for a whitespace-only credential', !host.calls.some((u) => u.includes('/rpc.php')), host.calls);
+}
+{
+  const host = makeHost(happy);
+  const out = await search(host, {}, cfg({ credential: '' }));
+  ok('searches without a credential', Array.isArray(out) && out.length === 3, out?.length);
+  ok('skips login when anonymous', !host.calls.some((u) => u.includes('/rpc.php')), host.calls);
+  const req = host.reqs.find((r) => r.url.includes('/eapi/book/search'));
+  ok(
+    'sends no session cookie when anonymous',
+    !/remix_userid|remix_userkey/.test(String(header(req?.init, 'cookie') ?? '')),
+    header(req?.init, 'cookie'),
+  );
+}
+{
+  const host = makeHost(happy);
+  const err = await plugin
+    .resolveFile(
+      { guid: '123456:abcdef1234567890', title: 'Frankenstein', bookTitle: 'Frankenstein', format: 'epub', sizeBytes: 1258291 },
+      cfg({ credential: '' }),
+      host,
+      AbortSignal.timeout(5000),
+    )
+    .catch((e) => e);
+  ok('grabbing without a credential reports unauthorized', err?.code === 'unauthorized', err?.message);
+  ok('grabbing anonymously never reaches the file link', !host.calls.some((u) => u.includes('/file')), host.calls);
+}
+{
+  const out = await plugin.test(cfg({ credential: '' }), makeHost(happy));
+  ok('tests anonymously with a search probe', out?.success === true && out?.indexerName === 'Z-Library', JSON.stringify(out));
+}
+{
+  const probeHost = makeHost(happy);
+  await plugin.test(cfg({ credential: '' }), probeHost);
+  ok('anonymous test costs no login', !probeHost.calls.some((u) => u.includes('/rpc.php')), probeHost.calls);
+}
+{
+  const out = await plugin.test(
+    cfg({ credential: '' }),
+    makeHost(() => res('<html><body>not json at all</body></html>', { headers: { 'content-type': 'text/html' } })),
+  );
+  ok('anonymous test fails rather than throwing', out?.success === false && typeof out?.error === 'string', JSON.stringify(out));
 }
 
 console.log('exactMatch, empty, exactEnd');
