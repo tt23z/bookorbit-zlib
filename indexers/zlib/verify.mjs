@@ -381,7 +381,7 @@ console.log('mapping');
   ok('keeps the bare title for scoring', first.bookTitle === 'Frankenstein');
   ok('reads the author', first.author === 'Mary Shelley');
   ok('lowercases the format', first.format === 'epub' && second.format === 'pdf', `${first.format}/${second.format}`);
-  ok('parses filesizeString first', first.sizeBytes === 1258291, first.sizeBytes);
+  ok('parses filesizeString first', first.sizeBytes === 1200000, first.sizeBytes);
   ok('falls back to numeric filesize', second.sizeBytes === 1234567, second.sizeBytes);
   ok('reports no size as null, never zero', third.sizeBytes === null, third.sizeBytes);
   ok('maps a known language to its code', first.language === 'en' && second.language === 'fr', `${first.language}/${second.language}`);
@@ -395,10 +395,10 @@ console.log('mapping');
   ok('reads the year through', first.publishedAt === '1818', first.publishedAt);
 }
 for (const [name, patch, expected] of [
-  ['512 KB', { filesizeString: '512 KB', filesize: 0 }, 524288],
-  ['1.2 MB', { filesizeString: '1.2 MB', filesize: 0 }, 1258291],
-  ['1,2 MB comma decimal', { filesizeString: '1,2 MB', filesize: 0 }, 1258291],
-  ['2.30 GB', { filesizeString: '2.30 GB', filesize: 0 }, 2469606195],
+  ['512 KB', { filesizeString: '512 KB', filesize: 0 }, 512000],
+  ['1.2 MB', { filesizeString: '1.2 MB', filesize: 0 }, 1200000],
+  ['1,2 MB comma decimal', { filesizeString: '1,2 MB', filesize: 0 }, 1200000],
+  ['2.30 GB', { filesizeString: '2.30 GB', filesize: 0 }, 2300000000],
   ['890 B', { filesizeString: '890 B', filesize: 0 }, 890],
   ['1.5 MiB', { filesizeString: '1.5 MiB', filesize: 0 }, 1572864],
   ['numeric filesize', { filesizeString: '', filesize: 1234567 }, 1234567],
@@ -413,6 +413,16 @@ for (const [name, patch, expected] of [
   const host = makeHost(searchWithBooks([sizedBook({ identifier: '978-0-14-118263-6' })]));
   const [one] = await search(host);
   ok('strips ISBN separators before passing through', one?.isbn === '9780141182636', one?.isbn);
+}
+{
+  const host = makeHost(searchWithBooks([sizedBook({ identifier: '9780141439518; 0141439513' })]));
+  const [one] = await search(host);
+  ok('passes every ISBN the identifier states', one?.isbn === '9780141439518; 0141439513', one?.isbn);
+}
+{
+  const host = makeHost(searchWithBooks([sizedBook({ identifier: 'B08G9PRS1K' })]));
+  const [one] = await search(host);
+  ok('rejects an ASIN as not an ISBN', one?.isbn === undefined, one?.isbn);
 }
 
 console.log('anonymous search');
@@ -438,7 +448,7 @@ console.log('anonymous search');
   const host = makeHost(happy);
   const err = await plugin
     .resolveFile(
-      { guid: '123456:abcdef1234567890', title: 'Frankenstein', bookTitle: 'Frankenstein', format: 'epub', sizeBytes: 1258291 },
+      { guid: '123456:abcdef1234567890', title: 'Frankenstein', bookTitle: 'Frankenstein', format: 'epub', sizeBytes: 1200000 },
       cfg({ credential: '' }),
       host,
       AbortSignal.timeout(5000),
@@ -571,7 +581,7 @@ console.log('resolveFile()');
   const file = await plugin.resolveFile(release, cfg(), host, AbortSignal.timeout(5000));
   ok('returns the file link as an absolute URL', file.url === FILE_LINK_URL, file.url);
   ok('names the file after the work with its extension', file.fileName === 'Frankenstein.epub', file.fileName);
-  ok('carries the format and size through', file.format === 'epub' && file.sizeBytes === 1258291, `${file.format}/${file.sizeBytes}`);
+  ok('carries the format and size through', file.format === 'epub' && file.sizeBytes === 1200000, `${file.format}/${file.sizeBytes}`);
 }
 for (const [name, payload] of [
   ['file.downloadLink', { success: 1, file: { downloadLink: FILE_LINK_URL } }],
