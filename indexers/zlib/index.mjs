@@ -47,18 +47,18 @@ const AUDIOBOOK_EXTENSIONS = new Set(['mp3', 'm4b']);
 const SIZE_RE = /([\d.,]+)\s*([kmgt]?i?b)/i;
 const SIZE_MULT = {
   b: 1,
-  kb: 1024,
+  kb: 1000,
   kib: 1024,
-  mb: 1024 ** 2,
+  mb: 1e6,
   mib: 1024 ** 2,
-  gb: 1024 ** 3,
+  gb: 1e9,
   gib: 1024 ** 3,
-  tb: 1024 ** 4,
+  tb: 1e12,
   tib: 1024 ** 4,
 };
 
-/** Field gate: only a plausible ISBN passes through, ASINs and junk do not. */
-const ISBN_FIELD_RE = /^(97[89]?\d{9}[\dX])$/i;
+/** Field gate: only plausible ISBNs pass through, ASINs and junk do not. */
+const ISBN_FIELD_RE = /^(?:97[89]\d{10}|\d{9}[\dX])$/i;
 const ISBN_LIKE_RE = /^(\d{9}[\dX]|\d{13})$/i;
 const CLEAN_EXT_RE = /^[a-z0-9]{2,5}$/;
 
@@ -120,7 +120,7 @@ const CODE_TO_NAME = {
 
 export default {
   apiVersion: 1,
-  version: '0.4.0',
+  version: '0.4.1',
   update: {
     manifestUrl: 'https://raw.githubusercontent.com/tt23z/bookorbit-zlib/main/updates/zlib.json',
     ed25519PublicKey: 'XBRuXnfVuLHqkGogyr5UaLsSlVXRYoplQ4mwXdiHXU0',
@@ -662,7 +662,7 @@ function toRelease(row) {
   const language = Object.prototype.hasOwnProperty.call(LANGUAGE_BY_NAME, langKey)
     ? LANGUAGE_BY_NAME[langKey]
     : undefined;
-  const isbn = isbnOrNull(row.identifier ?? row.isbn);
+  const isbn = isbnOrNull(row.identifier, row.isbn, row.isbn13);
 
   return {
     guid: `${id}:${hash}`,
@@ -717,9 +717,19 @@ function parseSize(stringValue, numericValue) {
   return null;
 }
 
-function isbnOrNull(value) {
-  const cleaned = String(value ?? '').replace(/[- ]/g, '').trim();
-  return ISBN_FIELD_RE.test(cleaned) ? cleaned.toUpperCase() : undefined;
+function isbnOrNull(...values) {
+  const found = [];
+  const seen = new Set();
+  for (const value of values) {
+    const text = String(value ?? '');
+    for (const match of text.match(/\b(?:97[89][- ]?)?(?:\d[- ]?){9}[\dxX]\b/g) ?? []) {
+      const cleaned = match.replace(/[- ]/g, '').toUpperCase();
+      if (!ISBN_FIELD_RE.test(cleaned) || seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      found.push(cleaned);
+    }
+  }
+  return found.length > 0 ? found.join('; ') : undefined;
 }
 
 /** ISBN-looking query text, or null when the query carries no ISBN. */
